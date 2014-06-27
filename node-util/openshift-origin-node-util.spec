@@ -20,6 +20,8 @@ Requires:      oddjob
 Requires:      rng-tools
 Requires:      rubygem-openshift-origin-node
 Requires:      %{?scl:%scl_prefix}rubygem-daemons
+Requires:      %{?scl:%scl_prefix}rubygem-ffi
+Requires:      %{?scl:%scl_prefix}rubygem-eventmachine
 Requires:      httpd
 Requires:      php >= 5.3.2
 Requires:      lsof

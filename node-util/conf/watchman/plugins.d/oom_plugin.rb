@@ -1,139 +1,311 @@
 #--
-# Copyright 2014 Red Hat, Inc.
+## Copyright 2014 Red Hat, Inc.
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##    http://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##++
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#++
-
-require 'date'
-require 'set'
 require 'openshift-origin-node/model/watchman/watchman_plugin'
-require 'openshift-origin-node/utils/shell_exec'
-require 'openshift-origin-node/utils/cgroups'
-require 'openshift-origin-node/utils/cgroups/libcgroup'
-require 'openshift-origin-node/model/application_container'
+require 'ffi'
+require 'ffi/tools/const_generator'
+require "eventmachine"
 
-OP_TIMEOUT=90
+$cgroot = "/cgroup/memory/openshift"
 
-# Provide Watchman with monitoring of CGroups resource killing of gears
+module EventFD
+  extend FFI::Library
+  ffi_lib 'c'
+  ['EFD_CLOEXEC','EFD_NONBLOCK','EFD_SEMAPHORE'].each do |const|
+    const_set(const,FFI::ConstGenerator.new(nil, :required => true) do |gen|
+      gen.include 'sys/eventfd.h'
+      gen.const(const)
+    end[const].to_i)
+  end
+  attach_function :eventfd, [:uint, :int], :int
+end
+
 class OomPlugin < OpenShift::Runtime::WatchmanPlugin
-  PLUGIN_NAME    = 'OOM Plugin'
-  MEMSW_LIMIT    = 'memory.memsw.limit_in_bytes'
-  MEMSW_USAGE    = 'memory.memsw.usage_in_bytes'
+  def initialize(config, logger, gears, operation)
+    super
 
-  # @param [see OpenShift::Runtime::WatchmanPlugin#initialize] config
-  # @param [see OpenShift::Runtime::WatchmanPlugin#initialize] logger
-  # @param [see OpenShift::Runtime::WatchmanPlugin#initialize] gears
-  # @param [see OpenShift::Runtime::WatchmanPlugin#initialize] operation
-  # @param [Fixnum] number of seconds to wait after calling forcestop
-  def initialize(config, logger, gears, operation, stop_wait_seconds = 10)
-    super(config, logger, gears, operation)
-    # TODO: Make this configurable?
-    @memsw_multiplier = 1.1
-    @last_check = 0
-    @check_interval = ENV['OOM_CHECK_PERIOD'].nil? ? 0 : ENV['OOM_CHECK_PERIOD'].to_i
-    @stop_wait_seconds = stop_wait_seconds
+    return if disabled?
+
+    @gears_last_updated = nil
+
+    @event_watcher = ::OpenShift::Runtime::WatchmanPlugin::EventWatcher.new(@config)
+    # @event_watcher.gears_updated(@gears)
+    @event_watcher.start
   end
 
-  # Search for gears under_oom
-  # @param [OpenShift::Runtime::WatchmanPluginTemplate::Iteration] iteration timestamps of given events
-  # @return void
   def apply(iteration)
-    return if @gears.empty? || (Time.now.to_i - @check_interval) < @last_check
-    # Syslog.info %Q(#{PLUGIN_NAME}: Iterating gears)
-    @last_check = Time.now.to_i
+    return if disabled?
 
-    @gears.ids.each do |uuid|
-      cgroup = OpenShift::Runtime::Utils::Cgroups::Libcgroup.new(uuid)
-      begin
-        oom_control = cgroup.fetch('memory.oom_control')['memory.oom_control']
-      rescue
-        # Usually means the user has been deleted
-        next
-      end
-      next if oom_control['under_oom'] != '1'
+    if @gears_last_updated.nil? or @gears.last_updated != @gears_last_updated
+      @event_watcher.gears_updated(@gears)
+      @gears_last_updated = @gears.last_updated
+    end
+  end
 
-      Syslog.info %Q(#{PLUGIN_NAME}: Found gear #{uuid} under OOM.)
+  def disabled?
+    # @disabled ||= @config.get('WATCHMAN_OOM_EVENTFD_ENABLED') != 'true'
+    return false
+  end
+end
 
-      # Now we need to extend the memory temporarily to see if that solves
-      # the problem.
+module OpenShift
+  module Runtime
+    class WatchmanPlugin
+      class EventWatcher
+        DEFAULT_INTERVAL = 60
 
-      #store memory limit
-      # Should we infer the template from the current values?
-      cg = OpenShift::Runtime::Utils::Cgroups.new(uuid)
-      restore_memsw_limit = cg.templates[:default][MEMSW_LIMIT].to_i
-      orig_memsw_limit = cgroup.fetch(MEMSW_LIMIT)[MEMSW_LIMIT].to_i
+        attr_reader :delay, :config
 
-      # Increase limit by 10% in order to clean up processes. Trying to
-      # restart a gear already at its memory limit is treacherous.
-      increased = (orig_memsw_limit * @memsw_multiplier).round(0)
-      Syslog.info %Q(#{PLUGIN_NAME}: Increasing memory for gear #{uuid} to #{increased} and restarting)
-      begin
-        cgroup.store(MEMSW_LIMIT, increased)
-      rescue
-        # This is not fatal; it just makes things less likely to work
-        Syslog.info %Q(#{PLUGIN_NAME}: Failed to increase memory limit for gear #{uuid})
-      end
+        def initialize(config)
+          @config = config
+          Syslog.info "Initializing Watchman OOM Eventfd plugin"
 
-      begin
-        # If gear is under OOM and OOM kill is enabled, skip this and go
-        # straight to kill_procs / restart, since the gear has already
-        # received kill signals, and if it's wedged, spawning more
-        # processes for stop action will just make the kernel do more work.
-        if oom_control['oom_kill_disable'] == '1'
-          begin
-            out, err, rc = ::OpenShift::Runtime::Utils.oo_spawn("oo-admin-ctl-gears forcestopgear #{uuid}", timeout: OP_TIMEOUT)
-            # Does rc == 0 here indicate success when forcestop is used?
-            # Also, does forcestop actually get to its "pkill -9" if
-            # the gear is under OOM?
-            # NB: memory reset and gear restart happen in the "ensure" block
-            next unless rc != 0
-            Syslog.info %Q(#{PLUGIN_NAME}: Force stop failed for gear #{uuid} , rc=#{rc}, stderr=#{err}")
-          rescue ::OpenShift::Runtime::Utils::ShellExecutionException => e
-            Syslog.info %Q(#{PLUGIN_NAME}: Force stop failed for gear #{uuid}: #{e.message}")
-            # This is primarily to catch timeouts
+          # Set the sleep time for the metrics thread
+          # default to running every 60 seconds if not set in node.conf
+          @delay = Integer(@config.get('WATCHMAN_OOM_EVENTFD_INTERVAL')) rescue DEFAULT_INTERVAL
+
+          Syslog.info "Watchman OOM eventfd interval = #{@delay}s"
+
+          @mutex = Mutex.new
+        end
+
+        def gear_metadata
+          @gear_metadata ||= Hash.new do |all_md, uuid|
+            all_md[uuid] = OOM_Listener.new(uuid)
           end
         end
 
-        sleep @stop_wait_seconds
 
-        # Verify that we are ready to reset to the old limit
-        retries = 3
-        current = cgroup.fetch(MEMSW_USAGE)[MEMSW_USAGE].to_i
-        app = OpenShift::Runtime::ApplicationContainer.from_uuid(uuid)
-        while current > restore_memsw_limit && retries > 0
-          increased = (increased * @memsw_multiplier).round(0)
-          Syslog.info %Q(#{PLUGIN_NAME}: Increasing memory for gear #{uuid} to #{increased} and killing processes)
-          cgroup.store(MEMSW_LIMIT, increased)
-          app.kill_procs()
-          sleep 5
-          retries -= 1
-          current = cgroup.fetch(MEMSW_USAGE)[MEMSW_USAGE].to_i
-        end
-      ensure
-        # Reset memory limit
-        begin
-          cgroup.store(MEMSW_LIMIT, restore_memsw_limit)
-        rescue
-          Syslog.warning %Q(#{PLUGIN_NAME}: Failed to lower memsw limit for gear #{uuid} from #{increased} to #{orig_memsw_limit})
+        # Cache the metadata for each gear
+        def gears_updated(gears)
+          # need to sync modifications to gear_metadata
+          @mutex.synchronize do
+            seen = []
+
+            gears.ids.each do |uuid|
+              # keep track of each uuid we've seen this time
+              seen << uuid
+
+              # add the uuid to the metadata if it's new;
+              # data will be loaded lazily via Hash.new block above
+              gear_metadata[uuid].watch unless gear_metadata.has_key?(uuid)
+            end
+
+            # remove metadata for all uuids that previously were in gear_metadata
+            # but are no longer in the active gears list
+            gear_metadata.delete_if { |key, value| !seen.include?(key) && gear_metadata[key].unwatch }
+          end
         end
 
-        # Finally, restart
-        begin
-          start(uuid)
-        rescue ::OpenShift::Runtime::Utils::ShellExecutionException => e
-          Syslog.info %Q(#{PLUGIN_NAME}: Start failed for gear #{uuid}: #{e.message}")
+                # Step that is run on each interval
+        #
+        # Mutex acquired and held for duration of method
+        def tick
+          # need to sync access to gear_metadata
+          @mutex.synchronize do
+            if gear_metadata.size > 0
+              Syslog.info("Watching #{gear_metadata.size} gears")
+            end
+          end
+        rescue => e
+          Syslog.info("OOM: unhandled exception #{e.message}\n" + e.backtrace.join("\n"))
+        end
+
+        def start
+          Thread.new do
+            Syslog.info("revving up the machine")
+            begin
+              EM.run {
+                tick
+                EM.add_periodic_timer(@delay) do
+                  Syslog.info("event loop")
+                  tick
+                end
+              }
+            rescue => e
+              Syslog.info("EM thread crash: #{e.message}")
+            end
+          end
         end
       end
+
+      class OOM_Listener
+        attr_accessor :efd
+        attr_accessor :ofd
+        attr_accessor :ev
+        attr_accessor :conn
+        attr_reader   :uid
+
+        def initialize(uid)
+          @ev = nil
+          @ofd = nil
+          @efd = nil
+          @conn = nil
+          @uid = uid
+
+          Syslog.info("Add listener object for #{@uid}")
+
+        end
+
+        def open
+          @ev = EventFD.eventfd(0, EventFD::EFD_NONBLOCK)
+          @ofd = File.open("#{$cgroot}/#{@uid}/memory.oom_control")
+          IO.write("#{$cgroot}/#{@uid}/cgroup.event_control","#{@ev} #{@ofd.fileno}")
+          @efd = IO.for_fd(@ev,"r+b")
+        end
+
+        def close
+          return nil if @conn == nil
+          @conn.detach
+          @efd.close
+          @ofd.close
+          @conn = nil
+        end
+
+        # TODO: throw away events already pending when we start watching?
+        def watch
+          return if self.conn != nil
+          Syslog.info("watching #{@uid}")
+          self.open
+          EM.watch @efd do |conn|
+            class << conn
+              attr_accessor :efd
+              attr_accessor :uid
+              def notify_readable
+                data = @efd.read_nonblock(8).unpack('Q')[0]
+                Syslog.info("#{@uid} received OOM event (#{data})")
+                fixer = Fixer.new(@uid)
+                fixer.fix
+              end
+            end
+            conn.efd = @efd
+            conn.uid = @uid
+            conn.notify_readable = true
+            @conn = conn
+          end
+        end
+
+        def unwatch
+          return if self.conn == nil
+          Syslog.info("unwatching #{@uid}")
+          self.close
+        end
+      end
+
+      class Fixer
+        MEMSW_LIMIT = 'memory.memsw.limit_in_bytes'
+        OOM_OP_TIMEOUT = 30
+        PLUGIN_NAME = "OOM Fixer"
+
+        def initialize(uuid)
+          @uuid = uuid
+          @memsw_multiplier = 1.1
+        end
+
+        def try_cgstore(cg, attr, value, retries=3)
+          1.upto(retries) do
+            begin
+              cg.store(attr, value)
+              return true
+            rescue
+              sleep 1
+            end
+          end
+          return false
+        end
+
+        def try_cgfetch(cg, attr, retries=3)
+          1.upto(retries) do
+            begin
+              return cg.fetch(attr).to_i
+            rescue
+              sleep 1
+            end
+          end
+          return nil
+        end
+
+        def fix
+          #store memory limit
+          # Should we infer the template from the current values?
+          cg = OpenShift::Runtime::Utils::Cgroups.new(@uuid)
+          restore_memsw_limit = cg.templates[:default][MEMSW_LIMIT].to_i
+          orig_memsw_limit = try_cgfetch(cg, MEMSW_LIMIT)
+
+          # Increase limit by 10% in order to clean up processes. Trying to
+          # restart a gear already at its memory limit is treacherous.
+          increased = (orig_memsw_limit * @memsw_multiplier).round(0)
+          Syslog.info %Q(#{PLUGIN_NAME}: Increasing memory for gear #{@uuid} to #{increased} and restarting)
+          ret = try_cgstore(cg, MEMSW_LIMIT, increased)
+          Syslog.info %Q(#{PLUGIN_NAME}: Failed to increase memory limit for gear #{@uuid}) unless ret
+
+          begin
+            # If gear is under OOM and OOM kill is enabled, skip this and go
+            # straight to kill_procs / restart, since the gear has already
+            # received kill signals, and if it's wedged, spawning more
+            # processes for stop action will just make the kernel do more work.
+            if true # oom_control['oom_kill_disable'] == '1'
+              begin
+                out, err, rc = ::OpenShift::Runtime::Utils.oo_spawn("oo-admin-ctl-gears forcestopgear #{@uuid}", timeout: OOM_OP_TIMEOUT)
+                # Does rc == 0 here indicate success when forcestop is used?
+                # Also, does forcestop actually get to its "pkill -9" if
+                # the gear is under OOM?
+                # NB: memory reset and gear restart happen in the "ensure" block
+                return unless rc != 0
+                Syslog.info %Q(#{PLUGIN_NAME}: Force stop failed for gear #{@uuid} , rc=#{rc}")
+              rescue ::OpenShift::Runtime::Utils::ShellExecutionException => e
+                Syslog.info %Q(#{PLUGIN_NAME}: Force stop failed for gear #{@uuid}: #{e.message}")
+                # This is primarily to catch timeouts
+              end
+            end
+
+            sleep 5
+
+            # Verify that we are ready to reset to the old limit
+            current = try_cgfetch(MEMSW_USAGE) || increased
+            app = ::OpenShift::Runtime::ApplicationContainer.from_uuid(@uuid)
+
+            while current > restore_memsw_limit && retries > 0
+              increased = (increased * @memsw_multiplier).round(0)
+              Syslog.info %Q(#{PLUGIN_NAME}: Increasing memory for gear #{@uuid} to #{increased} and killing processes)
+              ret = try_cgstore(MEMSW_LIMIT, increased)
+              Syslog.info %Q(#{PLUGIN_NAME}: Failed to increase memory limit for gear #{@uuid}) unless ret
+
+              app.kill_procs()
+              sleep 5
+              retries -= 1
+              current = try_cgfetch(MEMSW_USAGE) || current
+            end
+
+          ensure
+            # Reset memory limit
+            ret = try_cgstore(MEMSW_LIMIT, restore_memsw_limit)
+            Syslog.warning %Q(#{PLUGIN_NAME}: Failed to lower memsw limit for gear #{@uuid} from #{increased} to #{orig_memsw_limit}) unless ret
+
+            # Finally, restart
+            begin
+              out, err, rc = ::OpenShift::Runtime::Utils.oo_spawn("oo-admin-ctl-gears startgear #{@uuid}")
+            rescue ::OpenShift::Runtime::Utils::ShellExecutionException => e
+              Syslog.info %Q(#{PLUGIN_NAME}: Start failed for gear #{@uuid}: #{e.message}")
+            end
+          end
+        end
+      end
+
     end
   end
 end
+
